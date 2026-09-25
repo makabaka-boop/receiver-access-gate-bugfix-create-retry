@@ -10,7 +10,9 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -249,6 +251,156 @@ func main() {
 		fail("list response leaks token material: %s", body)
 	}
 
+	step("uncertain completion: SHARED create commits but its response is lost")
+	rx8 := "rx-verify-lost-" + suffix()
+	key8 := "duty-switch-" + rx8
+	postCreateDropResponse(api1, rx8, "SHARED", key8)
+	if n := len(mustList(api2, rx8)); n != 1 {
+		fail("lost-response create persisted, want 1 row, got %d", n)
+	}
+	// Retrying the same business request on the other API instance must
+	// reconcile to the single existing grant and recover its token.
+	r8 := mustCreateKeyed(api2, rx8, "SHARED", key8, http.StatusOK)
+	if !r8.replayed || r8.grant.Status != "ACTIVE" {
+		fail("retry of lost create must be a replay, got %+v replayed=%v", r8.grant, r8.replayed)
+	}
+	if n := len(mustList(api1, rx8)); n != 1 {
+		fail("retry inserted a duplicate grant, got %d rows", n)
+	}
+	// A different caller/key is blocked from exclusive and cannot claim
+	// the recovered grant. An unrelated SHARED request is admitted (shared
+	// coexistence) but stays a separate grant the original key cannot
+	// touch; release it with its own token so later row counts stay exact.
+	mustCreateKeyed(api1, rx8, "EXCLUSIVE", "other-business-"+rx8, http.StatusConflict)
+	intruder := mustCreateKeyed(api2, rx8, "SHARED", "other-business-2-"+rx8, http.StatusCreated)
+	if intruder.grant.ID == r8.grant.ID {
+		fail("stranger key resolved to the original grant")
+	}
+	mustRelease(api2, intruder.grant.ID, r8.token, http.StatusForbidden)
+	mustRelease(api1, intruder.grant.ID, intruder.token, http.StatusOK)
+	// Key with a different mode is a request-definition conflict.
+	mustCreateKeyed(api1, rx8, "EXCLUSIVE", key8, http.StatusUnprocessableEntity)
+	if g := findGrant(mustList(api2, rx8), r8.grant.ID); g.Status != "ACTIVE" || g.Mode != "SHARED" {
+		fail("conflicting replays must leave the one active row untouched: %+v", g)
+	}
+	// The recovered token releases the orphaned grant; reconciled view
+	// then reports RELEASED without ever creating a second row.
+	mustRelease(api1, r8.grant.ID, r8.token, http.StatusOK)
+	r8b := mustCreateKeyed(api2, rx8, "SHARED", key8, http.StatusOK)
+	if !r8b.replayed || r8b.grant.Status != "RELEASED" || r8b.token != r8.token {
+		fail("reconciliation after release diverged: %+v", r8b)
+	}
+	if g := findGrant(mustList(api1, rx8), r8.grant.ID); g.Status != "RELEASED" {
+		fail("replay after release must keep the one original row: %+v", g)
+	}
+	// Exclusive admission can finally proceed via a fresh business key.
+	mustCreateKeyed(api2, rx8, "EXCLUSIVE", "next-night-"+rx8, http.StatusCreated)
+
+	step("uncertain completion: EXCLUSIVE create commits but its response is lost")
+	rx9 := "rx-verify-lostx-" + suffix()
+	key9 := "duty-exclusive-" + rx9
+	postCreateDropResponse(api2, rx9, "EXCLUSIVE", key9)
+	// An outsider only sees BUSY and cannot distinguish/take the winner.
+	mustCreateKeyed(api1, rx9, "EXCLUSIVE", "intruder-"+rx9, http.StatusConflict)
+	mustCreateKeyed(api2, rx9, "SHARED", "intruder2-"+rx9, http.StatusConflict)
+	// The owner retries on the other instance and recognizes its own win.
+	r9 := mustCreateKeyed(api1, rx9, "EXCLUSIVE", key9, http.StatusOK)
+	if !r9.replayed || r9.grant.Mode != "EXCLUSIVE" || r9.grant.Status != "ACTIVE" {
+		fail("owner retry must replay the exclusive grant, got %+v", r9.grant)
+	}
+	if n := len(mustList(api2, rx9)); n != 1 {
+		fail("exclusive retry must not duplicate, got %d rows", n)
+	}
+	mustRelease(api2, r9.grant.ID, r9.token, http.StatusOK)
+
+	step("uncertain completion: same-key concurrent resend across both APIs")
+	rx10 := "rx-verify-keyrace-" + suffix()
+	key10 := "concurrent-" + rx10
+	const resends = 12
+	var wg2 sync.WaitGroup
+	type resendResult struct {
+		id, token string
+		code      int
+	}
+	rr := make(chan resendResult, resends)
+	for i := 0; i < resends; i++ {
+		base := api1
+		if i%2 == 1 {
+			base = api2
+		}
+		wg2.Add(1)
+		go func() {
+			defer wg2.Done()
+			r, code := createKeyed(base, rx10, "SHARED", key10)
+			rr <- resendResult{id: r.ID, token: r.token, code: code}
+		}()
+	}
+	wg2.Wait()
+	close(rr)
+	creates, replays := 0, 0
+	var soleID, soleToken string
+	for r := range rr {
+		switch r.code {
+		case http.StatusCreated:
+			creates++
+		case http.StatusOK:
+			replays++
+		default:
+			fail("concurrent resend: unexpected status %d", r.code)
+		}
+		if soleID == "" {
+			soleID, soleToken = r.id, r.token
+		} else if r.id != soleID || r.token != soleToken {
+			fail("concurrent resends produced divergent business results")
+		}
+	}
+	if creates != 1 || replays != resends-1 {
+		fail("resend race: want 1 create / %d replays, got %d / %d", resends-1, creates, replays)
+	}
+	if n := len(mustList(api1, rx10)); n != 1 {
+		fail("concurrent resends left %d rows, want exactly 1", n)
+	}
+	// The unique recovered token operates the grant; upgrade proceeds and
+	// reconciles from either instance.
+	mustUpgrade(api2, soleID, soleToken, http.StatusOK)
+	r10 := mustCreateKeyed(api1, rx10, "SHARED", key10, http.StatusOK)
+	if !r10.replayed || r10.grant.ID != soleID || r10.grant.Mode != "EXCLUSIVE" || r10.token != soleToken {
+		fail("reconciliation after upgrade diverged: %+v", r10)
+	}
+	mustRelease(api1, soleID, soleToken, http.StatusOK)
+
+	step("uncertain completion: reconciled SHARED grant still upgrades behind a barrier")
+	rx11 := "rx-verify-lostupg-" + suffix()
+	key11 := "recover-then-upgrade-" + rx11
+	postCreateDropResponse(api1, rx11, "SHARED", key11)
+	other11 := mustCreateKeyed(api2, rx11, "SHARED", "competitor-"+rx11, http.StatusCreated)
+	r11 := mustCreateKeyed(api2, rx11, "SHARED", key11, http.StatusOK)
+	up11 := mustUpgrade(api1, r11.grant.ID, r11.token, http.StatusOK)
+	if up11.Status != "UPGRADE_PENDING" {
+		fail("recovered grant upgrade: want UPGRADE_PENDING, got %+v", up11)
+	}
+	mustCreateKeyed(api2, rx11, "SHARED", "newcomer-"+rx11, http.StatusConflict)
+	// Reconcile mid-wait: same row, same token, pending status.
+	r11b := mustCreateKeyed(api1, rx11, "SHARED", key11, http.StatusOK)
+	if !r11b.replayed || r11b.grant.Status != "UPGRADE_PENDING" || r11b.token != r11.token {
+		fail("reconcile mid-upgrade diverged: %+v", r11b)
+	}
+	mustRelease(api2, other11.grant.ID, other11.token, http.StatusOK)
+	r11c := mustCreateKeyed(api2, rx11, "SHARED", key11, http.StatusOK)
+	if r11c.grant.Mode != "EXCLUSIVE" || r11c.grant.Status != "ACTIVE" {
+		fail("reconcile after competitor release: want ACTIVE EXCLUSIVE, got %+v", r11c)
+	}
+
+	step("uncertain completion: listings never expose request keys or tokens")
+	for _, target := range []struct{ rx, key, token string }{
+		{rx8, key8, r8.token}, {rx9, key9, r9.token}, {rx10, key10, soleToken},
+	} {
+		raw := mustListRaw(api1, target.rx) + mustListRaw(api2, target.rx)
+		if strings.Contains(raw, target.key) || strings.Contains(raw, target.token) || strings.Contains(raw, "request_key") {
+			fail("listing leaks idempotency capability for %s: %s", target.rx, raw)
+		}
+	}
+
 	fmt.Println("VERIFY OK")
 }
 
@@ -398,4 +550,77 @@ func mustUpgrade(base, id, token string, want int) grant {
 		fail("upgrade %s: want %d, got %d (%s)", id, want, code, body)
 	}
 	return g
+}
+
+type keyedResult struct {
+	grant
+	token    string
+	replayed bool
+}
+
+func createKeyed(base, receiver, mode, key string) (keyedResult, int) {
+	payload, _ := json.Marshal(map[string]string{"mode": mode, "request_key": key})
+	resp, err := client.Post(base+"/receivers/"+receiver+"/grants", "application/json", bytes.NewReader(payload))
+	if err != nil {
+		fail("keyed create: %v", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		return keyedResult{}, resp.StatusCode
+	}
+	var out struct {
+		grant
+		OwnerToken string `json:"owner_token"`
+		Replayed   bool   `json:"replayed"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		fail("keyed create: decode: %v", err)
+	}
+	if out.OwnerToken == "" {
+		fail("keyed create response must carry owner_token")
+	}
+	if strings.Contains(string(raw), "request_key") {
+		fail("create response must not echo request_key field")
+	}
+	return keyedResult{grant: out.grant, token: out.OwnerToken, replayed: out.Replayed}, resp.StatusCode
+}
+
+func mustCreateKeyed(base, receiver, mode, key string, want int) keyedResult {
+	r, code := createKeyed(base, receiver, mode, key)
+	if code != want {
+		fail("keyed create %s (%s) on %s: want %d, got %d", mode, key, receiver, want, code)
+	}
+	return r
+}
+
+// postCreateDropResponse commits a keyed create on the server while
+// abandoning its HTTP response: the raw TCP connection is closed without
+// reading only after the new row becomes visible through the listing API,
+// proving the commit landed before the network "interruption".
+func postCreateDropResponse(base, receiver, mode, key string) {
+	u, err := url.Parse(base)
+	if err != nil {
+		fail("parse base url: %v", err)
+	}
+	payload, _ := json.Marshal(map[string]string{"mode": mode, "request_key": key})
+	conn, err := net.DialTimeout("tcp", u.Host, 5*time.Second)
+	if err != nil {
+		fail("dial: %v", err)
+	}
+	defer conn.Close()
+	req := fmt.Sprintf(
+		"POST /receivers/%s/grants HTTP/1.1\r\nHost: %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+		receiver, u.Host, len(payload), payload)
+	if _, err := conn.Write([]byte(req)); err != nil {
+		fail("write dropped-create request: %v", err)
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if n := len(mustList(base, receiver)); n >= 1 {
+			return // committed; close the socket and discard the response
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	fail("dropped create on %s never committed", receiver)
 }

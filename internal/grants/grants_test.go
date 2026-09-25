@@ -26,9 +26,10 @@ import (
 )
 
 type cluster struct {
-	store *grants.Store
-	api1  *httptest.Server
-	api2  *httptest.Server
+	store  *grants.Store
+	api1   *httptest.Server
+	api2   *httptest.Server
+	stores []*grants.Store // every opened pool, closed on cleanup
 }
 
 func newCluster(t *testing.T) *cluster {
@@ -37,20 +38,24 @@ func newCluster(t *testing.T) *cluster {
 	if dsn == "" {
 		t.Skip("TEST_DATABASE_URL not set; skipping integration test")
 	}
+	c := &cluster{}
 	open := func() *grants.Store {
 		s, err := grants.NewStore(context.Background(), dsn)
 		if err != nil {
 			t.Fatalf("open store: %v", err)
 		}
+		c.stores = append(c.stores, s)
 		return s
 	}
-	c := &cluster{store: open()}
+	c.store = open()
 	c.api1 = httptest.NewServer(grants.NewServer(open()))
 	c.api2 = httptest.NewServer(grants.NewServer(open()))
 	t.Cleanup(func() {
 		c.api1.Close()
 		c.api2.Close()
-		c.store.Close()
+		for _, s := range c.stores {
+			s.Close()
+		}
 	})
 	return c
 }
@@ -62,21 +67,31 @@ func (c *cluster) restart(t *testing.T) {
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	c.api1.Close()
 	c.api2.Close()
+	// Release the pools backing the stopped processes so repeated
+	// restarts across many tests cannot exhaust the database's connection
+	// budget.
+	for _, s := range c.stores {
+		s.Close()
+	}
+	c.stores = nil
 	open := func() *grants.Store {
 		s, err := grants.NewStore(context.Background(), dsn)
 		if err != nil {
 			t.Fatalf("reopen store: %v", err)
 		}
+		c.stores = append(c.stores, s)
 		return s
 	}
+	c.store = open()
 	s1, s2 := open(), open()
 	c.api1 = httptest.NewServer(grants.NewServer(s1))
 	c.api2 = httptest.NewServer(grants.NewServer(s2))
 	t.Cleanup(func() {
 		c.api1.Close()
 		c.api2.Close()
-		s1.Close()
-		s2.Close()
+		for _, s := range c.stores {
+			s.Close()
+		}
 	})
 }
 

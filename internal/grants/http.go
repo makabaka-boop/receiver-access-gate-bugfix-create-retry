@@ -33,12 +33,24 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 type createRequest struct {
 	Mode string `json:"mode"`
+	// RequestKey is the caller-chosen business identifier for this
+	// request. Supplying it makes the request idempotent: retries with
+	// the same (receiver, request_key) return the one existing grant
+	// instead of creating another, and recover its owner token. It is
+	// never echoed in listing responses, so it stays a capability of the
+	// authorized caller. It is optional; without it the historical
+	// one-token-per-create semantics apply.
+	RequestKey string `json:"request_key"`
 }
 
-// createResponse is the only payload that ever carries the owner token.
+// createResponse is the only payload that ever carries the owner token. For
+// an idempotent replay it carries the same grant and token the original
+// request produced (possibly since released or upgraded), with Replayed set
+// so the caller can reconcile an uncertain outcome.
 type createResponse struct {
 	Grant
 	OwnerToken string `json:"owner_token"`
+	Replayed   bool   `json:"replayed"`
 }
 
 func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
@@ -52,14 +64,24 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "BAD_MODE")
 		return
 	}
-	g, token, err := s.store.CreateGrant(r.Context(), receiver, req.Mode)
+	if len(req.RequestKey) > 256 {
+		writeError(w, http.StatusBadRequest, "BAD_REQUEST_KEY")
+		return
+	}
+	g, token, replayed, err := s.store.CreateGrant(r.Context(), receiver, req.Mode, req.RequestKey)
 	switch {
 	case errors.Is(err, ErrBusy):
 		writeError(w, http.StatusConflict, "BUSY")
+	case errors.Is(err, ErrKeyConflict):
+		writeError(w, http.StatusUnprocessableEntity, "REQUEST_KEY_CONFLICT")
 	case err != nil:
 		writeError(w, http.StatusInternalServerError, "INTERNAL")
 	default:
-		writeJSON(w, http.StatusCreated, createResponse{Grant: g, OwnerToken: token})
+		status := http.StatusCreated
+		if replayed {
+			status = http.StatusOK
+		}
+		writeJSON(w, status, createResponse{Grant: g, OwnerToken: token, Replayed: replayed})
 	}
 }
 
