@@ -1,0 +1,57 @@
+name: grantgate
+
+# Published ports are overridable from the environment, e.g.
+#   API1_PORT=9080 API2_PORT=9081 DB_PORT=55432 docker compose up --build
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-grants}
+      POSTGRES_USER: ${POSTGRES_USER:-grants}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-grants}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    ports:
+      - "${DB_PORT:-5432}:5432"
+
+  api1: &api
+    build: .
+    command: ["/bin/server"]
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-grants}:${POSTGRES_PASSWORD:-grants}@db:5432/${POSTGRES_DB:-grants}?sslmode=disable
+      LISTEN_ADDR: :8080
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${API1_PORT:-8080}:8080"
+
+  api2:
+    <<: *api
+    ports:
+      - "${API2_PORT:-8081}:8080"
+
+  # One-shot acceptance gate: runs the verify binary against both API
+  # processes and exits 0 on success, 1 on failure.
+  #   docker compose up --build --exit-code-from verify
+  verify:
+    <<: *api
+    command: ["/bin/verify"]
+    environment:
+      API1_URL: http://api1:8080
+      API2_URL: http://api2:8080
+    depends_on:
+      api1:
+        condition: service_started
+      api2:
+        condition: service_started
+    ports: []
+    restart: "no"
+
+volumes:
+  db-data:
