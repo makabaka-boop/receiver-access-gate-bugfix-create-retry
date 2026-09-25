@@ -10,7 +10,9 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -243,10 +245,117 @@ func main() {
 	mustUpgrade(api2, r1.ID, rt1, http.StatusConflict)
 	mustUpgrade(api1, "00000000000000000000000000000000", "tok", http.StatusNotFound)
 
-	step("query responses never leak tokens")
+	step("keyed create: a retry with the same request key replays the original outcome")
+	rxK := "rx-verify-key-" + suffix()
+	key := "req-" + suffix()
+	k1, ktok1 := mustCreateKey(api1, rxK, "SHARED", key, http.StatusCreated)
+	k2, ktok2 := mustCreateKey(api2, rxK, "SHARED", key, http.StatusCreated)
+	if k2.ID != k1.ID || ktok2 != ktok1 {
+		fail("keyed retry: want replay of grant %s with its original token, got %+v", k1.ID, k2)
+	}
+	if n := len(mustList(api1, rxK)); n != 1 {
+		fail("keyed retry must not add a record, got %d grants", n)
+	}
+
+	step("response lost after commit: the keyed retry recovers grant and token")
+	rxD := "rx-verify-drop-" + suffix()
+	dkey := "req-" + suffix()
+	dropCreate(api1, rxD, "SHARED", dkey)
+	d1, dtok := mustCreateKey(api2, rxD, "SHARED", dkey, http.StatusCreated)
+	dg := mustList(api1, rxD)
+	if len(dg) != 1 || dg[0].ID != d1.ID {
+		fail("lost create must converge to exactly one grant, list=%+v replay=%+v", dg, d1)
+	}
+	mustCreate(api1, rxD, "EXCLUSIVE", http.StatusConflict) // keyless: someone else's occupancy
+	mustRelease(api2, d1.ID, dtok, http.StatusOK)
+
+	step("exclusive create with lost response: keyed retry returns the caller's own grant")
+	rxX := "rx-verify-xdrop-" + suffix()
+	xkey := "req-" + suffix()
+	dropCreate(api1, rxX, "EXCLUSIVE", xkey)
+	x1, xtok := mustCreateKey(api2, rxX, "EXCLUSIVE", xkey, http.StatusCreated)
+	xg := mustList(api1, rxX)
+	if len(xg) != 1 || xg[0].ID != x1.ID || xg[0].Mode != "EXCLUSIVE" {
+		fail("lost exclusive create must converge to one EXCLUSIVE grant, list=%+v replay=%+v", xg, x1)
+	}
+	mustCreate(api1, rxX, "EXCLUSIVE", http.StatusConflict) // keyless: still busy
+	mustRelease(api2, x1.ID, xtok, http.StatusOK)
+	mustCreate(api1, rxX, "EXCLUSIVE", http.StatusCreated) // receiver freed by the recovered token
+
+	step("concurrent retries with one request key create exactly one grant")
+	rxC := "rx-verify-keyrace-" + suffix()
+	ckey := "req-" + suffix()
+	const retries = 10
+	type keyOutcome struct {
+		id, tok string
+		code    int
+	}
+	outs := make([]keyOutcome, retries)
+	var wgK sync.WaitGroup
+	for i := 0; i < retries; i++ {
+		base := api1
+		if i%2 == 1 {
+			base = api2
+		}
+		wgK.Add(1)
+		go func(b string, slot int) {
+			defer wgK.Done()
+			g, code, tok := createKey(b, rxC, "SHARED", ckey)
+			outs[slot] = keyOutcome{g.ID, tok, code}
+		}(base, i)
+	}
+	wgK.Wait()
+	for i, o := range outs {
+		if o.code != http.StatusCreated || o.id == "" || o.id != outs[0].id || o.tok != outs[0].tok {
+			fail("keyed race retry %d: %+v, want all identical to %+v", i, o, outs[0])
+		}
+	}
+	if cg := mustList(api1, rxC); len(cg) != 1 || cg[0].ID != outs[0].id {
+		fail("same-key race must leave exactly one grant, got %+v", cg)
+	}
+
+	step("a recovered token drives upgrade and release")
+	rxU := "rx-verify-keyupg-" + suffix()
+	ukey := "req-" + suffix()
+	dropCreate(api1, rxU, "SHARED", ukey)
+	u1, utok1 := mustCreateKey(api2, rxU, "SHARED", ukey, http.StatusCreated)
+	u2, utok2 := mustCreate(api2, rxU, "SHARED", http.StatusCreated)
+	if up := mustUpgrade(api1, u1.ID, utok1, http.StatusOK); up.Status != "UPGRADE_PENDING" {
+		fail("upgrade with recovered token: want UPGRADE_PENDING, got %+v", up)
+	}
+	mustRelease(api2, u2.ID, utok2, http.StatusOK)
+	if got := findGrant(mustList(api1, rxU), u1.ID); got.Mode != "EXCLUSIVE" || got.Status != "ACTIVE" {
+		fail("recovered grant not promoted after competitor release: %+v", got)
+	}
+	mustRelease(api1, u1.ID, utok1, http.StatusOK)
+
+	step("a request key reused with different parameters is rejected without side effects")
+	rxM := "rx-verify-keymix-" + suffix()
+	mkey := "req-" + suffix()
+	mustCreateKey(api1, rxM, "SHARED", mkey, http.StatusCreated)
+	mustCreateKey(api2, rxM, "EXCLUSIVE", mkey, http.StatusConflict)
+	mustCreateKey(api1, rxM+"-other", "SHARED", mkey, http.StatusConflict)
+	if n := len(mustList(api1, rxM)); n != 1 {
+		fail("mismatched reuse must not add records, got %d", n)
+	}
+	if n := len(mustList(api2, rxM+"-other")); n != 0 {
+		fail("mismatched reuse on another receiver must leave nothing, got %d", n)
+	}
+
+	step("a replay reflects the grant's current state")
+	mustRelease(api1, k1.ID, ktok1, http.StatusOK)
+	k3, ktok3 := mustCreateKey(api2, rxK, "SHARED", key, http.StatusCreated)
+	if k3.ID != k1.ID || k3.Status != "RELEASED" || ktok3 != ktok1 {
+		fail("replay after release: want %s RELEASED with original token, got %+v", k1.ID, k3)
+	}
+
+	step("query responses never leak tokens or request keys")
 	body := mustListRaw(api1, rx)
 	if strings.Contains(body, "token") || strings.Contains(body, tok1) {
 		fail("list response leaks token material: %s", body)
+	}
+	if kbody := mustListRaw(api2, rxK); strings.Contains(kbody, "token") || strings.Contains(kbody, key) {
+		fail("list response leaks token or request-key material: %s", kbody)
 	}
 
 	fmt.Println("VERIFY OK")
@@ -282,8 +391,22 @@ func waitReady(base string) {
 }
 
 func create(base, receiver, mode string) (grant, int, string) {
+	return createKey(base, receiver, mode, "")
+}
+
+// createKey posts a create request; a non-empty key is sent as the
+// Idempotency-Key header identifying the business request.
+func createKey(base, receiver, mode, key string) (grant, int, string) {
 	payload, _ := json.Marshal(map[string]string{"mode": mode})
-	resp, err := client.Post(base+"/receivers/"+receiver+"/grants", "application/json", bytes.NewReader(payload))
+	req, err := http.NewRequest(http.MethodPost, base+"/receivers/"+receiver+"/grants", bytes.NewReader(payload))
+	if err != nil {
+		fail("create: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if key != "" {
+		req.Header.Set("Idempotency-Key", key)
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		fail("create: %v", err)
 	}
@@ -300,15 +423,48 @@ func create(base, receiver, mode string) (grant, int, string) {
 		fail("create: decode: %v", err)
 	}
 	if out.OwnerToken == "" {
-		fail("create response must carry owner_token exactly once")
+		fail("create response must carry owner_token")
 	}
 	return out.grant, resp.StatusCode, out.OwnerToken
+}
+
+// dropCreate sends a keyed create request over a raw TCP connection and
+// closes it without reading the response, simulating an answer lost in
+// the network after the request was submitted. Whether that attempt
+// committed is deliberately left uncertain; the keyed retry that
+// follows is what must converge the business outcome.
+func dropCreate(base, receiver, mode, key string) {
+	u, err := url.Parse(base)
+	if err != nil {
+		fail("drop create: %v", err)
+	}
+	conn, err := net.DialTimeout("tcp", u.Host, 5*time.Second)
+	if err != nil {
+		fail("drop create dial: %v", err)
+	}
+	payload, _ := json.Marshal(map[string]string{"mode": mode})
+	if _, err := fmt.Fprintf(conn, "POST /receivers/%s/grants HTTP/1.1\r\nHost: %s\r\nContent-Type: application/json\r\nIdempotency-Key: %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+		receiver, u.Host, key, len(payload), payload); err != nil {
+		fail("drop create write: %v", err)
+	}
+	_ = conn.Close()
+	// Let the server finish (commit or roll back) before any retry
+	// arrives; the acceptance assertions hold on either path.
+	time.Sleep(300 * time.Millisecond)
 }
 
 func mustCreate(base, receiver, mode string, want int) (grant, string) {
 	g, code, token := create(base, receiver, mode)
 	if code != want {
 		fail("create %s on %s: want %d, got %d", mode, receiver, want, code)
+	}
+	return g, token
+}
+
+func mustCreateKey(base, receiver, mode, key string, want int) (grant, string) {
+	g, code, token := createKey(base, receiver, mode, key)
+	if code != want {
+		fail("create %s on %s (key %q): want %d, got %d", mode, receiver, key, want, code)
 	}
 	return g, token
 }

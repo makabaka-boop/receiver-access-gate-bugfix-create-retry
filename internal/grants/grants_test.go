@@ -89,6 +89,17 @@ func receiver(t *testing.T, prefix string) string {
 	return fmt.Sprintf("%s-%s", prefix, hex.EncodeToString(b))
 }
 
+// requestKey returns a fresh idempotency key identifying one business
+// request across all of its retries.
+func requestKey(t *testing.T) string {
+	t.Helper()
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		t.Fatal(err)
+	}
+	return "req-" + hex.EncodeToString(b)
+}
+
 type grantView struct {
 	ID       string `json:"grant_id"`
 	Receiver string `json:"receiver"`
@@ -98,8 +109,23 @@ type grantView struct {
 
 func createGrant(t *testing.T, base, rx, mode string) (grantView, string, int) {
 	t.Helper()
+	return createGrantKeyed(t, base, rx, mode, "")
+}
+
+// createGrantKeyed posts a create request; a non-empty key is sent as
+// the Idempotency-Key header identifying the business request.
+func createGrantKeyed(t *testing.T, base, rx, mode, key string) (grantView, string, int) {
+	t.Helper()
 	body, _ := json.Marshal(map[string]string{"mode": mode})
-	resp, err := http.Post(base+"/receivers/"+rx+"/grants", "application/json", bytes.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, base+"/receivers/"+rx+"/grants", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if key != "" {
+		req.Header.Set("Idempotency-Key", key)
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -247,6 +273,232 @@ func TestConcurrentExclusiveRace(t *testing.T) {
 		if len(gs) != 1 || gs[0].Mode != grants.ModeExclusive || gs[0].Status != grants.StatusActive {
 			t.Fatalf("via %s: want one ACTIVE EXCLUSIVE grant, got %+v", base, gs)
 		}
+	}
+}
+
+// TestSameKeyRetryReplaysOutcome covers the lost-response case: the
+// create committed but its answer never reached the caller. Retrying
+// with the same request key — even against the other API process —
+// replays the original grant id and owner token instead of minting a
+// second grant.
+func TestSameKeyRetryReplaysOutcome(t *testing.T) {
+	c := newCluster(t)
+	rx := receiver(t, "rx-key")
+	key := requestKey(t)
+
+	g1, tok1, code := createGrantKeyed(t, c.api1.URL, rx, grants.ModeShared, key)
+	if code != http.StatusCreated {
+		t.Fatalf("keyed create: status %d", code)
+	}
+
+	// The response is lost; the caller retries with the same key and
+	// recovers grant id and token.
+	g2, tok2, code := createGrantKeyed(t, c.api2.URL, rx, grants.ModeShared, key)
+	if code != http.StatusCreated || g2.ID != g1.ID || tok2 != tok1 {
+		t.Fatalf("keyed retry: code=%d grant=%+v (want replay of %s)", code, g2, g1.ID)
+	}
+	if gs := listGrants(t, c.api1.URL, rx); len(gs) != 1 {
+		t.Fatalf("keyed retry must not add a record: %+v", gs)
+	}
+
+	// A keyless retry is a different business request and still
+	// conflicts with the recovered grant.
+	if _, _, code := createGrant(t, c.api1.URL, rx, grants.ModeExclusive); code != http.StatusConflict {
+		t.Fatalf("keyless exclusive during recovered grant: want 409, got %d", code)
+	}
+
+	// The recovered token releases the recovered grant.
+	if g, code := releaseGrant(t, c.api2.URL, g1.ID, tok2); code != http.StatusOK || g.Status != grants.StatusReleased {
+		t.Fatalf("release with recovered token: code=%d grant=%+v", code, g)
+	}
+
+	// A later replay reflects the grant's current state and still
+	// returns the original token.
+	g3, tok3, code := createGrantKeyed(t, c.api1.URL, rx, grants.ModeShared, key)
+	if code != http.StatusCreated || g3.ID != g1.ID || g3.Status != grants.StatusReleased || tok3 != tok1 {
+		t.Fatalf("replay after release: code=%d grant=%+v", code, g3)
+	}
+}
+
+// TestExclusiveSameKeyRetryBeatsBusy covers the exclusive variant of the
+// lost response: without the key the retry would report BUSY against the
+// caller's own grant; with the key it replays the caller's own outcome.
+func TestExclusiveSameKeyRetryBeatsBusy(t *testing.T) {
+	c := newCluster(t)
+	rx := receiver(t, "rx-xkey")
+	key := requestKey(t)
+
+	g1, tok1, code := createGrantKeyed(t, c.api1.URL, rx, grants.ModeExclusive, key)
+	if code != http.StatusCreated {
+		t.Fatalf("keyed exclusive create: status %d", code)
+	}
+	g2, tok2, code := createGrantKeyed(t, c.api2.URL, rx, grants.ModeExclusive, key)
+	if code != http.StatusCreated || g2.ID != g1.ID || tok2 != tok1 {
+		t.Fatalf("keyed exclusive retry: code=%d grant=%+v (want replay of %s)", code, g2, g1.ID)
+	}
+	if gs := listGrants(t, c.api1.URL, rx); len(gs) != 1 {
+		t.Fatalf("keyed retry must not add a record: %+v", gs)
+	}
+	// Someone else's keyless exclusive request still sees BUSY.
+	if _, _, code := createGrant(t, c.api2.URL, rx, grants.ModeExclusive); code != http.StatusConflict {
+		t.Fatalf("keyless exclusive: want 409, got %d", code)
+	}
+	if _, code := releaseGrant(t, c.api1.URL, g1.ID, tok2); code != http.StatusOK {
+		t.Fatalf("release with recovered token: code=%d", code)
+	}
+}
+
+// TestConcurrentSameKeyCreate fires the same business request at both
+// API processes at once: exactly one grant may be created and every
+// retry must observe the same id and token.
+func TestConcurrentSameKeyCreate(t *testing.T) {
+	c := newCluster(t)
+	rx := receiver(t, "rx-keyrace")
+	key := requestKey(t)
+
+	const retries = 12
+	type outcome struct {
+		id, tok string
+		code    int
+	}
+	outs := make([]outcome, retries)
+	var wg sync.WaitGroup
+	for i := 0; i < retries; i++ {
+		base := c.api1.URL
+		if i%2 == 1 {
+			base = c.api2.URL
+		}
+		wg.Add(1)
+		go func(b string, slot int) {
+			defer wg.Done()
+			body, _ := json.Marshal(map[string]string{"mode": grants.ModeShared})
+			req, err := http.NewRequest(http.MethodPost, b+"/receivers/"+rx+"/grants", bytes.NewReader(body))
+			if err != nil {
+				outs[slot] = outcome{code: -1}
+				return
+			}
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Idempotency-Key", key)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				outs[slot] = outcome{code: -1}
+				return
+			}
+			defer resp.Body.Close()
+			raw, _ := io.ReadAll(resp.Body)
+			if resp.StatusCode != http.StatusCreated {
+				outs[slot] = outcome{code: resp.StatusCode}
+				return
+			}
+			var out struct {
+				grantView
+				OwnerToken string `json:"owner_token"`
+			}
+			if err := json.Unmarshal(raw, &out); err != nil {
+				outs[slot] = outcome{code: -1}
+				return
+			}
+			outs[slot] = outcome{out.ID, out.OwnerToken, resp.StatusCode}
+		}(base, i)
+	}
+	wg.Wait()
+
+	for i, o := range outs {
+		if o.code != http.StatusCreated || o.id == "" || o.id != outs[0].id || o.tok != outs[0].tok {
+			t.Fatalf("retry %d: %+v, want all identical to %+v", i, o, outs[0])
+		}
+	}
+	gs := listGrants(t, c.api1.URL, rx)
+	if len(gs) != 1 || gs[0].ID != outs[0].id {
+		t.Fatalf("same-key race must leave exactly one grant: %+v", gs)
+	}
+	if _, code := releaseGrant(t, c.api2.URL, gs[0].ID, outs[0].tok); code != http.StatusOK {
+		t.Fatalf("release with raced token: code=%d", code)
+	}
+}
+
+// TestRequestKeyMismatch rejects a key reused with different parameters
+// and leaves no record on either receiver.
+func TestRequestKeyMismatch(t *testing.T) {
+	c := newCluster(t)
+	rx := receiver(t, "rx-keymix")
+	key := requestKey(t)
+
+	if _, _, code := createGrantKeyed(t, c.api1.URL, rx, grants.ModeShared, key); code != http.StatusCreated {
+		t.Fatalf("keyed create: status %d", code)
+	}
+	if _, _, code := createGrantKeyed(t, c.api2.URL, rx, grants.ModeExclusive, key); code != http.StatusConflict {
+		t.Fatalf("mode mismatch: want 409, got %d", code)
+	}
+	other := receiver(t, "rx-keymix-other")
+	if _, _, code := createGrantKeyed(t, c.api1.URL, other, grants.ModeShared, key); code != http.StatusConflict {
+		t.Fatalf("receiver mismatch: want 409, got %d", code)
+	}
+	if gs := listGrants(t, c.api1.URL, rx); len(gs) != 1 {
+		t.Fatalf("mismatched reuse added a record: %+v", gs)
+	}
+	if gs := listGrants(t, c.api2.URL, other); len(gs) != 0 {
+		t.Fatalf("mismatched reuse on another receiver left records: %+v", gs)
+	}
+}
+
+// TestBusyOutcomeIsNotRemembered ensures a failed (BUSY) attempt records
+// nothing under its key: once the blocker clears, the same key is
+// decided afresh and its outcome becomes replayable.
+func TestBusyOutcomeIsNotRemembered(t *testing.T) {
+	c := newCluster(t)
+	rx := receiver(t, "rx-keybusy")
+	key := requestKey(t)
+
+	g, tok, _ := createGrant(t, c.api1.URL, rx, grants.ModeShared)
+	if _, _, code := createGrantKeyed(t, c.api2.URL, rx, grants.ModeExclusive, key); code != http.StatusConflict {
+		t.Fatalf("exclusive during shared: want 409, got %d", code)
+	}
+	if _, code := releaseGrant(t, c.api1.URL, g.ID, tok); code != http.StatusOK {
+		t.Fatalf("release blocker: code=%d", code)
+	}
+	x, xtok, code := createGrantKeyed(t, c.api2.URL, rx, grants.ModeExclusive, key)
+	if code != http.StatusCreated {
+		t.Fatalf("retry after blocker left: want 201, got %d", code)
+	}
+	x2, xtok2, code := createGrantKeyed(t, c.api1.URL, rx, grants.ModeExclusive, key)
+	if code != http.StatusCreated || x2.ID != x.ID || xtok2 != xtok {
+		t.Fatalf("replay of retried create: code=%d grant=%+v", code, x2)
+	}
+}
+
+// TestRequestKeySurvivesRestart restarts the whole fleet between the
+// lost response and the retry: the recorded outcome, and the lifecycle
+// it unlocks, must be identical afterwards.
+func TestRequestKeySurvivesRestart(t *testing.T) {
+	c := newCluster(t)
+	rx := receiver(t, "rx-keyrestart")
+	key := requestKey(t)
+
+	g1, tok1, code := createGrantKeyed(t, c.api1.URL, rx, grants.ModeShared, key)
+	if code != http.StatusCreated {
+		t.Fatalf("keyed create: status %d", code)
+	}
+
+	c.restart(t)
+
+	// The recorded outcome survives the restart: same grant, same token.
+	g2, tok2, code := createGrantKeyed(t, c.api2.URL, rx, grants.ModeShared, key)
+	if code != http.StatusCreated || g2.ID != g1.ID || tok2 != tok1 {
+		t.Fatalf("replay after restart: code=%d grant=%+v (want replay of %s)", code, g2, g1.ID)
+	}
+	if gs := listGrants(t, c.api1.URL, rx); len(gs) != 1 {
+		t.Fatalf("restart replay must not add a record: %+v", gs)
+	}
+
+	// The recovered token still drives the lifecycle: the sole grant
+	// upgrades straight to ACTIVE EXCLUSIVE and then releases.
+	up, code := upgradeGrant(t, c.api1.URL, g1.ID, tok2)
+	if code != http.StatusOK || up.Mode != grants.ModeExclusive || up.Status != grants.StatusActive {
+		t.Fatalf("upgrade with recovered token after restart: code=%d grant=%+v", code, up)
+	}
+	if _, code := releaseGrant(t, c.api2.URL, g1.ID, tok2); code != http.StatusOK {
+		t.Fatalf("release after restart: code=%d", code)
 	}
 }
 
@@ -717,5 +969,16 @@ VALUES ('legacy-grant-id', $1, 'SHARED', 'ACTIVE', $2)`, rx, digest[:]); err != 
 	// And the same legacy token releases it.
 	if g, code := releaseGrant(t, c.api1.URL, "legacy-grant-id", legacyToken); code != http.StatusOK || g.Status != grants.StatusReleased {
 		t.Fatalf("release legacy grant: code=%d grant=%+v", code, g)
+	}
+
+	// Keyed creates replay on the migrated database too.
+	key := requestKey(t)
+	kg1, ktok1, code := createGrantKeyed(t, c.api1.URL, rx, grants.ModeShared, key)
+	if code != http.StatusCreated {
+		t.Fatalf("keyed create on migrated db: status %d", code)
+	}
+	kg2, ktok2, code := createGrantKeyed(t, c.api2.URL, rx, grants.ModeShared, key)
+	if code != http.StatusCreated || kg2.ID != kg1.ID || ktok2 != ktok1 {
+		t.Fatalf("keyed replay on migrated db: code=%d grant=%+v", code, kg2)
 	}
 }

@@ -33,9 +33,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 type createRequest struct {
 	Mode string `json:"mode"`
+	// RequestID optionally identifies the business request for
+	// idempotent replay; the Idempotency-Key header takes precedence
+	// when both are sent.
+	RequestID string `json:"request_id"`
 }
 
-// createResponse is the only payload that ever carries the owner token.
+// createResponse is the only payload that ever carries the owner token:
+// the create itself and its idempotent replays to the same request key.
 type createResponse struct {
 	Grant
 	OwnerToken string `json:"owner_token"`
@@ -52,10 +57,23 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "BAD_MODE")
 		return
 	}
-	g, token, err := s.store.CreateGrant(r.Context(), receiver, req.Mode)
+	// A caller that keys its request can retry it safely: the committed
+	// outcome — grant id and owner token — is replayed to the same key,
+	// even if the original response was lost after commit.
+	key := r.Header.Get("Idempotency-Key")
+	if key == "" {
+		key = req.RequestID
+	}
+	if len(key) > 256 {
+		writeError(w, http.StatusBadRequest, "BAD_REQUEST")
+		return
+	}
+	g, token, err := s.store.CreateGrant(r.Context(), receiver, req.Mode, key)
 	switch {
 	case errors.Is(err, ErrBusy):
 		writeError(w, http.StatusConflict, "BUSY")
+	case errors.Is(err, ErrRequestMismatch):
+		writeError(w, http.StatusConflict, "REQUEST_MISMATCH")
 	case err != nil:
 		writeError(w, http.StatusInternalServerError, "INTERNAL")
 	default:

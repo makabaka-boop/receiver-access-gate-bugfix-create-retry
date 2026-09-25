@@ -12,6 +12,7 @@ import (
 	"errors"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -49,6 +50,10 @@ var (
 	// already waiting for promotion. At most one pending upgrade exists
 	// per receiver; the losing attempt changes nothing.
 	ErrUpgradePending = errors.New("upgrade pending")
+	// ErrRequestMismatch reports an idempotency key reused with a
+	// different receiver or mode than the committed request that
+	// recorded it. Nothing is modified.
+	ErrRequestMismatch = errors.New("request key reused with different parameters")
 )
 
 // Grant is the public view of one access grant. It never carries the owner
@@ -106,6 +111,23 @@ CREATE TABLE IF NOT EXISTS grants (
 )`); err != nil {
 			return err
 		}
+		// Request keys make creates idempotent across retries and API
+		// processes: the first committed create records its outcome —
+		// the grant and the owner token — under the caller-chosen key,
+		// so a retry after a lost response replays that outcome instead
+		// of minting a second grant. Only committed creates write here;
+		// failed attempts leave no key behind.
+		if _, err := tx.Exec(ctx, `
+CREATE TABLE IF NOT EXISTS create_requests (
+    key        TEXT PRIMARY KEY,
+    receiver   TEXT        NOT NULL,
+    mode       TEXT        NOT NULL,
+    grant_id   TEXT        NOT NULL,
+    token      TEXT        NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+)`); err != nil {
+			return err
+		}
 		// Upgrade databases created before upgrades existed: old records
 		// gain the column with its default and the status check is
 		// widened to admit UPGRADE_PENDING. Both statements are
@@ -131,15 +153,35 @@ CREATE INDEX IF NOT EXISTS grants_receiver_seq ON grants (receiver, seq)`)
 
 // CreateGrant atomically checks for conflicting active grants on receiver
 // and inserts a new ACTIVE grant. It returns the grant plus the owner
-// token, which is shown to the caller exactly once; only its SHA-256
-// digest is persisted.
-func (s *Store) CreateGrant(ctx context.Context, receiver, mode string) (Grant, string, error) {
+// token; only the token's SHA-256 digest is persisted on the grant
+// itself.
+//
+// A non-empty key makes the create idempotent across retries and API
+// processes: the first committed outcome is recorded under the key and
+// every later request presenting the same key replays it — the grant's
+// current state plus the original owner token — instead of creating a
+// second grant or reporting BUSY against the caller's own grant. This
+// is the recovery path for a response lost after commit. A key reused
+// with a different receiver or mode yields ErrRequestMismatch. Attempts
+// that lose the conflict check commit nothing and record nothing under
+// the key, so a retry after the blocker clears is decided afresh.
+func (s *Store) CreateGrant(ctx context.Context, receiver, mode, key string) (Grant, string, error) {
 	var g Grant
 	var token string
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		// Serialize grant decisions per receiver across all API processes.
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, receiver); err != nil {
 			return err
+		}
+		if key != "" {
+			replay, tok, err := lookupRequestLocked(ctx, tx, key, receiver, mode)
+			if err != nil {
+				return err
+			}
+			if replay.ID != "" {
+				g, token = replay, tok
+				return nil
+			}
 		}
 		// A SHARED request conflicts with any active EXCLUSIVE grant; an
 		// EXCLUSIVE request conflicts with any active grant at all. A
@@ -174,6 +216,11 @@ RETURNING id, receiver, mode, status`,
 			Scan(&g.ID, &g.Receiver, &g.Mode, &g.Status); err != nil {
 			return err
 		}
+		if key != "" {
+			if err := recordRequestLocked(ctx, tx, key, receiver, mode, id, tok); err != nil {
+				return err // rollback: grant and key record vanish together
+			}
+		}
 		token = tok
 		return nil
 	})
@@ -181,6 +228,50 @@ RETURNING id, receiver, mode, status`,
 		return Grant{}, "", err
 	}
 	return g, token, nil
+}
+
+// lookupRequestLocked returns the committed outcome recorded under key,
+// or a zero Grant when the key is unknown. A key recorded with a
+// different receiver or mode yields ErrRequestMismatch. The replayed
+// grant reflects its current state; the original owner token is
+// returned so the legitimate caller can still release or upgrade a
+// grant whose create response was lost.
+func lookupRequestLocked(ctx context.Context, tx pgx.Tx, key, receiver, mode string) (Grant, string, error) {
+	var g Grant
+	var token, storedReceiver, storedMode string
+	err := tx.QueryRow(ctx, `
+SELECT r.receiver, r.mode, r.token, g.id, g.receiver, g.mode, g.status
+FROM create_requests r
+JOIN grants g ON g.id = r.grant_id
+WHERE r.key = $1`, key).
+		Scan(&storedReceiver, &storedMode, &token, &g.ID, &g.Receiver, &g.Mode, &g.Status)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Grant{}, "", nil
+	}
+	if err != nil {
+		return Grant{}, "", err
+	}
+	if storedReceiver != receiver || storedMode != mode {
+		return Grant{}, "", ErrRequestMismatch
+	}
+	return g, token, nil
+}
+
+// recordRequestLocked persists the committed create outcome under key.
+// Same-key retries on the same receiver are serialized by the receiver
+// advisory lock and never reach this insert; a concurrent same-key
+// create on another receiver surfaces here as a unique violation and is
+// reported as ErrRequestMismatch. The whole transaction rolls back in
+// that case, so no stray grant is left behind.
+func recordRequestLocked(ctx context.Context, tx pgx.Tx, key, receiver, mode, grantID, token string) error {
+	_, err := tx.Exec(ctx, `
+INSERT INTO create_requests (key, receiver, mode, grant_id, token)
+VALUES ($1, $2, $3, $4, $5)`, key, receiver, mode, grantID, token)
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == "create_requests_pkey" {
+		return ErrRequestMismatch
+	}
+	return err
 }
 
 // ListGrants returns every grant for receiver in stable insertion order.
